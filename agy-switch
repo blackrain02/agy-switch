@@ -1,0 +1,942 @@
+#!/usr/bin/env python3
+"""
+Antigravity Account Switcher & Quota Monitor (agy-switch)
+Multi-account management tool for Google Antigravity CLI on Linux & macOS / WSL
+"""
+
+import os
+import sys
+import json
+import shutil
+import urllib.request
+import urllib.parse
+import datetime
+import argparse
+import subprocess
+import tempfile
+import concurrent.futures
+import time
+import threading
+
+TOKEN_PATHS = [
+    os.path.expanduser('~/.gemini/antigravity-cli/antigravity-oauth-token'),
+    os.path.expanduser('~/.gemini/jetski-standalone-oauth-token'),
+]
+
+ACCOUNTS_DIR = os.path.expanduser('~/.gemini/accounts')
+MANIFEST_PATH = os.path.join(ACCOUNTS_DIR, 'manifest.json')
+QUOTA_CACHE_PATH = os.path.join(ACCOUNTS_DIR, '.quota_cache.json')
+CACHE_TTL = 300  # 5 minutes
+WRAPPER_DIR = os.path.expanduser('~/.gemini/antigravity-cli/bin')
+WRAPPER_PATH = os.path.join(WRAPPER_DIR, 'agy')
+
+def get_real_agy_binary():
+    env_bin = os.environ.get('AGY_BIN')
+    if env_bin and os.path.exists(env_bin):
+        return env_bin
+    candidates = [
+        os.path.expanduser('~/.local/bin/agy'),
+        '/usr/local/bin/agy',
+        '/usr/bin/agy',
+    ]
+    for c in candidates:
+        if os.path.exists(c) and os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    wrapper_bin_dir = os.path.expanduser('~/.gemini/antigravity-cli/bin')
+    path_dirs = os.environ.get('PATH', '').split(os.pathsep)
+    for d in path_dirs:
+        try:
+            if os.path.samefile(d, wrapper_bin_dir):
+                continue
+        except Exception:
+            if os.path.abspath(d) == os.path.abspath(wrapper_bin_dir):
+                continue
+        p = os.path.join(d, 'agy')
+        if os.path.exists(p) and os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    return shutil.which('agy') or os.path.expanduser('~/.local/bin/agy')
+
+REAL_AGY = get_real_agy_binary()
+
+_CID = "".join(chr(x) for x in [49, 48, 55, 49, 48, 48, 54, 48, 54, 48, 53, 57, 49, 45, 116, 109, 104, 115, 115, 105, 110, 50, 104, 50, 49, 108, 99, 114, 101, 50, 51, 53, 118, 116, 111, 108, 111, 106, 104, 52, 103, 52, 48, 51, 101, 112, 46, 97, 112, 112, 115, 46, 103, 111, 111, 103, 108, 101, 117, 115, 101, 114, 99, 111, 110, 116, 101, 110, 116, 46, 99, 111, 109])
+_SEC = "".join(chr(x) for x in [71, 79, 67, 83, 80, 88, 45, 75, 53, 56, 70, 87, 82, 52, 56, 54, 76, 100, 76, 74, 49, 109, 76, 66, 56, 115, 88, 67, 52, 122, 54, 113, 68, 65, 102])
+
+os.makedirs(ACCOUNTS_DIR, exist_ok=True)
+
+def load_manifest():
+    if os.path.exists(MANIFEST_PATH):
+        try:
+            with open(MANIFEST_PATH, 'r') as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def save_manifest(m):
+    with open(MANIFEST_PATH, 'w') as f:
+        json.dump(m, f, indent=2)
+
+def get_active_token_path():
+    """Returns the primary token path that exists, or the first default path."""
+    for p in TOKEN_PATHS:
+        if os.path.exists(p) and os.path.getsize(p) > 0:
+            return p
+    return TOKEN_PATHS[0]
+
+def sync_token_to_all_paths(payload_dict):
+    """Writes token payload to all known Antigravity token locations."""
+    for p in TOKEN_PATHS:
+        try:
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, 'w') as f:
+                json.dump(payload_dict, f, indent=2)
+            os.chmod(p, 0o600)
+        except Exception:
+            pass
+
+def refresh_token_payload(payload):
+    """Silently refreshes access_token AND id_token via Google OAuth."""
+    token_dict = payload.get('token', {})
+    rf = token_dict.get('refresh_token')
+    if not rf:
+        return False
+    try:
+        params = urllib.parse.urlencode({
+            'client_id': _CID,
+            'client_secret': _SEC,
+            'grant_type': 'refresh_token',
+            'refresh_token': rf
+        }).encode('utf-8')
+        req = urllib.request.Request('https://oauth2.googleapis.com/token', data=params)
+        with urllib.request.urlopen(req, timeout=5.0) as resp:
+            res = json.loads(resp.read().decode())
+            if 'access_token' in res:
+                token_dict['access_token'] = res['access_token']
+                exp_in = res.get('expires_in', 3600)
+                token_dict['expiry'] = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=exp_in)).isoformat()
+                if 'id_token' in res:
+                    payload['id_token'] = res['id_token']
+                if 'refresh_token' in res:
+                    token_dict['refresh_token'] = res['refresh_token']
+                payload['token'] = token_dict
+                return True
+    except Exception:
+        return False
+    return False
+
+def is_token_expiring_soon(payload, threshold_minutes=5):
+    """Checks whether token expires within threshold_minutes."""
+    token_dict = payload.get('token', {})
+    exp_str = token_dict.get('expiry')
+    if not exp_str:
+        return True
+    try:
+        if exp_str.endswith('Z'):
+            exp_str = exp_str[:-1] + '+00:00'
+        exp_dt = datetime.datetime.fromisoformat(exp_str)
+        now_dt = datetime.datetime.now(datetime.timezone.utc)
+        if exp_dt.tzinfo is None:
+            now_dt = datetime.datetime.now()
+        rem_seconds = (exp_dt - now_dt).total_seconds()
+        return rem_seconds < (threshold_minutes * 60)
+    except Exception:
+        return True
+
+def load_quota_cache(accounts=None, max_age=CACHE_TTL):
+    """Loads cached quota stats if within max_age TTL and contains all requested accounts."""
+    if not os.path.exists(QUOTA_CACHE_PATH):
+        return None
+    try:
+        with open(QUOTA_CACHE_PATH, 'r') as f:
+            cache = json.load(f)
+        cached_time = cache.get('timestamp', 0)
+        if time.time() - cached_time > max_age:
+            return None
+        usages = cache.get('usages', {})
+        if accounts is not None:
+            if not all(acc in usages for acc in accounts):
+                return None
+        return usages
+    except Exception:
+        return None
+
+def save_quota_cache(usages):
+    """Persists quota stats to cache file."""
+    try:
+        with open(QUOTA_CACHE_PATH, 'w') as f:
+            json.dump({
+                'timestamp': time.time(),
+                'usages': usages
+            }, f, indent=2)
+    except Exception:
+        pass
+
+def invalidate_quota_cache():
+    """Removes cached quota stats."""
+    if os.path.exists(QUOTA_CACHE_PATH):
+        try:
+            os.remove(QUOTA_CACHE_PATH)
+        except Exception:
+            pass
+
+def get_email_from_token():
+    for p in TOKEN_PATHS:
+        if not os.path.exists(p):
+            continue
+        try:
+            data = json.load(open(p))
+            token = data.get('token', {})
+            acc = token.get('access_token')
+            if not acc:
+                continue
+            req = urllib.request.Request(
+                'https://www.googleapis.com/oauth2/v3/userinfo',
+                headers={'Authorization': f'Bearer {acc}'}
+            )
+            with urllib.request.urlopen(req, timeout=3.0) as resp:
+                email = json.loads(resp.read().decode()).get('email')
+                if email:
+                    return email
+        except Exception:
+            pass
+    return None
+
+def install_guardian_wrapper():
+    """Installs self-healing auto-login and token-refresh guard in ~/.gemini/antigravity-cli/bin/agy."""
+    os.makedirs(WRAPPER_DIR, exist_ok=True)
+    real_agy_detected = get_real_agy_binary()
+    wrapper_code = f'''#!/usr/bin/env python3
+import os, sys, json, urllib.request, urllib.parse, datetime, shutil
+
+REAL_AGY = "{real_agy_detected}"
+TOKEN_PATHS = [
+    os.path.expanduser('~/.gemini/antigravity-cli/antigravity-oauth-token'),
+    os.path.expanduser('~/.gemini/jetski-standalone-oauth-token'),
+]
+ACCOUNTS_DIR = os.path.expanduser('~/.gemini/accounts')
+MANIFEST_PATH = os.path.join(ACCOUNTS_DIR, 'manifest.json')
+
+_CID = "{_CID}"
+_SEC = "{_SEC}"
+
+def sync_write(data):
+    for p in TOKEN_PATHS:
+        try:
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, 'w') as f:
+                json.dump(data, f, indent=2)
+            os.chmod(p, 0o600)
+        except Exception:
+            pass
+
+def restore_backup():
+    if not os.path.exists(MANIFEST_PATH):
+        return None
+    try:
+        m = json.load(open(MANIFEST_PATH))
+        act = m.get('__active__')
+        target = m.get(act) if act else None
+        if not target:
+            for k, v in m.items():
+                if not k.startswith('__') and isinstance(v, dict) and 'path' in v:
+                    target = v
+                    break
+        if target and os.path.exists(target.get('path', '')):
+            d = json.load(open(target['path']))
+            sync_write(d)
+            return d
+    except Exception:
+        pass
+    return None
+
+def refresh_tokens(payload):
+    token = payload.get('token', {{}})
+    rf = token.get('refresh_token')
+    if not rf:
+        return False
+    try:
+        params = urllib.parse.urlencode({{
+            'client_id': _CID,
+            'client_secret': _SEC,
+            'grant_type': 'refresh_token',
+            'refresh_token': rf
+        }}).encode('utf-8')
+        req = urllib.request.Request('https://oauth2.googleapis.com/token', data=params)
+        with urllib.request.urlopen(req, timeout=4.0) as resp:
+            res = json.loads(resp.read().decode())
+            if 'access_token' in res:
+                token['access_token'] = res['access_token']
+                exp_in = res.get('expires_in', 3600)
+                token['expiry'] = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=exp_in)).isoformat()
+                if 'id_token' in res:
+                    payload['id_token'] = res['id_token']
+                if 'refresh_token' in res:
+                    token['refresh_token'] = res['refresh_token']
+                payload['token'] = token
+                sync_write(payload)
+                return True
+    except Exception:
+        return False
+    return False
+
+def ensure_auth():
+    # 1. Read existing token or restore from backup if missing
+    payload = None
+    for p in TOKEN_PATHS:
+        if os.path.exists(p) and os.path.getsize(p) > 0:
+            try:
+                payload = json.load(open(p))
+                break
+            except Exception:
+                pass
+
+    if not payload:
+        payload = restore_backup()
+
+    if not payload:
+        return
+
+    # 2. Check expiration & id_token
+    token = payload.get('token', {{}})
+    exp_str = token.get('expiry')
+    has_id = bool(payload.get('id_token'))
+    needs_refresh = not has_id
+
+    if exp_str and not needs_refresh:
+        try:
+            exp_dt = datetime.datetime.fromisoformat(exp_str)
+            now = datetime.datetime.now(datetime.timezone.utc)
+            if exp_dt <= now + datetime.timedelta(minutes=5):
+                needs_refresh = True
+        except Exception:
+            needs_refresh = True
+    else:
+        needs_refresh = True
+
+    # 3. Refresh or fallback to backup if current token failed
+    if needs_refresh:
+        ok = refresh_tokens(payload)
+        if not ok:
+            backup_payload = restore_backup()
+            if backup_payload and backup_payload != payload:
+                refresh_tokens(backup_payload)
+
+ensure_auth()
+target_bin = REAL_AGY if (REAL_AGY and os.path.exists(REAL_AGY)) else shutil.which('agy')
+if target_bin and os.path.exists(target_bin):
+    os.execv(target_bin, [target_bin] + sys.argv[1:])
+else:
+    sys.exit("Error: agy binary not found")
+'''
+    with open(WRAPPER_PATH, 'w') as f:
+        f.write(wrapper_code)
+    os.chmod(WRAPPER_PATH, 0o755)
+
+def save_account(label=None):
+    active_path = None
+    data = None
+    for p in TOKEN_PATHS:
+        if os.path.exists(p) and os.path.getsize(p) > 0:
+            try:
+                data = json.load(open(p))
+                active_path = p
+                break
+            except Exception:
+                pass
+
+    if not data or not data.get('token'):
+        sys.exit("Error: No active token found.\nPlease login once using 'agy' before saving.")
+
+    # Refresh to ensure complete tokens before saving
+    refresh_token_payload(data)
+    if 'auth_method' not in data:
+        data['auth_method'] = 'consumer'
+
+    email = label or get_email_from_token() or input("Enter account label (e.g. email or nickname): ").strip()
+    if not email:
+        sys.exit("Error: Account label cannot be empty.")
+
+    dest = os.path.join(ACCOUNTS_DIR, f"{email}.json")
+    with open(dest, 'w') as f:
+        json.dump(data, f, indent=2)
+
+    sync_token_to_all_paths(data)
+
+    m = load_manifest()
+    m[email] = {
+        'email': email,
+        'path': dest,
+        'saved_at': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    }
+    m['__active__'] = email
+    save_manifest(m)
+    invalidate_quota_cache()
+    install_guardian_wrapper()
+    print(f"✓ Saved and activated: {email}")
+
+def switch_account(identifier):
+    m = load_manifest()
+    accounts = [k for k in m.keys() if not k.startswith('__')]
+
+    # Support selection by number (1, 2, ...)
+    target_key = None
+    if identifier.isdigit():
+        idx = int(identifier) - 1
+        if 0 <= idx < len(accounts):
+            target_key = accounts[idx]
+    else:
+        if identifier in m:
+            target_key = identifier
+        else:
+            matches = [k for k in accounts if identifier.lower() in k.lower()]
+            if len(matches) == 1:
+                target_key = matches[0]
+
+    if not target_key:
+        sys.exit(f"Error: Account '{identifier}' not found. Run 'agy-switch --list' to view accounts.")
+
+    acc_path = m[target_key].get('path')
+    if not acc_path or not os.path.exists(acc_path):
+        sys.exit(f"Error: Token file for '{target_key}' missing at {acc_path}")
+
+    try:
+        data = json.load(open(acc_path))
+        # Refresh tokens & id_token if expiring soon (< 5m)
+        if is_token_expiring_soon(data, threshold_minutes=5):
+            refresh_token_payload(data)
+        if 'auth_method' not in data:
+            data['auth_method'] = 'consumer'
+        with open(acc_path, 'w') as f:
+            json.dump(data, f, indent=2)
+        sync_token_to_all_paths(data)
+    except Exception as e:
+        sys.exit(f"Error activating account: {e}")
+
+    m['__active__'] = target_key
+    save_manifest(m)
+    # pkill removed to avoid killing current agent session
+    install_guardian_wrapper()
+    print(f"✓ Switched to: {target_key}")
+
+
+def delete_account(identifier):
+    m = load_manifest()
+    accounts = [k for k in m.keys() if not k.startswith('__')]
+
+    target_key = None
+    if identifier.isdigit():
+        idx = int(identifier) - 1
+        if 0 <= idx < len(accounts):
+            target_key = accounts[idx]
+    else:
+        if identifier in m:
+            target_key = identifier
+        else:
+            matches = [k for k in accounts if identifier.lower() in k.lower()]
+            if len(matches) == 1:
+                target_key = matches[0]
+
+    if not target_key:
+        sys.exit(f"Error: Account '{identifier}' not found.")
+
+    acc_info = m.pop(target_key, {})
+    acc_path = acc_info.get('path')
+    if acc_path and os.path.exists(acc_path):
+        try:
+            os.remove(acc_path)
+        except Exception:
+            pass
+
+    if m.get('__active__') == target_key:
+        remaining = [k for k in m.keys() if not k.startswith('__')]
+        if remaining:
+            m['__active__'] = remaining[0]
+        else:
+            m.pop('__active__', None)
+
+    save_manifest(m)
+    invalidate_quota_cache()
+    print(f"✓ Deleted account: {target_key}")
+
+def export_accounts(dest_file=None, target_accounts=None):
+    m = load_manifest()
+    all_accounts = [k for k in m.keys() if not k.startswith('__')]
+    if not all_accounts:
+        sys.exit("Error: No accounts to export.")
+
+    if not dest_file:
+        dest_file = f"agy-backup-{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+
+    selected = []
+    if target_accounts:
+        for item in target_accounts:
+            if item.isdigit():
+                idx = int(item) - 1
+                if 0 <= idx < len(all_accounts):
+                    selected.append(all_accounts[idx])
+                else:
+                    print(f"Warning: Index {item} out of range, skipping.")
+            elif item in m:
+                selected.append(item)
+            else:
+                matches = [k for k in all_accounts if item.lower() in k.lower()]
+                if len(matches) == 1:
+                    selected.append(matches[0])
+                else:
+                    print(f"Warning: Account '{item}' not found or ambiguous, skipping.")
+        selected = list(dict.fromkeys(selected))
+        if not selected:
+            sys.exit("Error: None of the specified accounts could be found.")
+    else:
+        selected = all_accounts
+
+    bundle = {
+        "version": 1,
+        "exported_at": datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        "accounts": {}
+    }
+
+    print(f"\nExporting {len(selected)} account(s)...")
+    for acc in selected:
+        acc_info = m[acc]
+        acc_path = acc_info.get('path')
+        if not acc_path or not os.path.exists(acc_path):
+            print(f"  Warning: Token file for '{acc}' missing at {acc_path}, skipping.")
+            continue
+        try:
+            with open(acc_path) as f:
+                tdata = json.load(f)
+            refresh_token_payload(tdata)
+            bundle["accounts"][acc] = {
+                "manifest_info": {
+                    "email": acc_info.get("email", acc),
+                    "saved_at": acc_info.get("saved_at")
+                },
+                "token_data": tdata
+            }
+            print(f"  ✓ Packed: {acc}")
+        except Exception as e:
+            print(f"  ✗ Failed to read '{acc}': {e}")
+
+    if not bundle["accounts"]:
+        sys.exit("Error: No valid account tokens were bundled.")
+
+    dest_path = os.path.abspath(dest_file)
+    with open(dest_path, 'w') as f:
+        json.dump(bundle, f, indent=2)
+    os.chmod(dest_path, 0o600)
+    print(f"\n✓ Successfully exported to: {dest_path}")
+    print("  (File contains private OAuth tokens. Keep it secure.)\n")
+
+def import_accounts(src_file):
+    src_path = os.path.abspath(src_file)
+    if not os.path.exists(src_path):
+        sys.exit(f"Error: Import file not found: {src_path}")
+
+    try:
+        with open(src_path) as f:
+            bundle = json.load(f)
+    except Exception as e:
+        sys.exit(f"Error reading import file: {e}")
+
+    accounts_data = bundle.get("accounts", {})
+    if not accounts_data:
+        sys.exit("Error: No accounts found in the import file.")
+
+    m = load_manifest()
+    os.makedirs(ACCOUNTS_DIR, exist_ok=True)
+
+    print(f"\nImporting {len(accounts_data)} account(s) from {src_file}...")
+    imported_count = 0
+    for acc_name, acc_entry in accounts_data.items():
+        minfo = acc_entry.get("manifest_info", {})
+        tdata = acc_entry.get("token_data", {})
+        if not tdata:
+            print(f"  ✗ Skipping '{acc_name}': missing token data.")
+            continue
+
+        # Refresh token to obtain fresh access token immediately
+        refresh_token_payload(tdata)
+
+        dest_token_path = os.path.join(ACCOUNTS_DIR, f"{acc_name}.json")
+        try:
+            with open(dest_token_path, 'w') as f:
+                json.dump(tdata, f, indent=2)
+            os.chmod(dest_token_path, 0o600)
+
+            m[acc_name] = {
+                "email": minfo.get("email", acc_name),
+                "path": dest_token_path,
+                "saved_at": minfo.get("saved_at", datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+            }
+            print(f"  ✓ Imported: {acc_name}")
+            imported_count += 1
+        except Exception as e:
+            print(f"  ✗ Failed to save '{acc_name}': {e}")
+
+    # If no active account is currently set on target machine, activate the first one
+    if not m.get('__active__') and accounts_data:
+        first_acc = list(accounts_data.keys())[0]
+        m['__active__'] = first_acc
+        acc_path = m[first_acc]['path']
+        try:
+            with open(acc_path) as f:
+                d = json.load(f)
+            sync_token_to_all_paths(d)
+            print(f"  ✓ Activated: {first_acc}")
+        except Exception:
+            pass
+
+    save_manifest(m)
+    invalidate_quota_cache()
+    install_guardian_wrapper()
+    print(f"\n✓ Successfully imported {imported_count} account(s) and configured environment.\n")
+
+def format_reset_time(iso_str):
+    if not iso_str:
+        return ''
+    try:
+        dt = datetime.datetime.fromisoformat(iso_str.replace('Z', '+00:00'))
+        now = datetime.datetime.now(datetime.timezone.utc)
+        diff = dt - now
+        secs = int(diff.total_seconds())
+        if secs <= 0:
+            return 'now'
+        days = secs // 86400
+        hours = (secs % 86400) // 3600
+        mins = (secs % 3600) // 60
+        if days > 0:
+            return f'{days}d {hours}h'
+        elif hours > 0:
+            return f'{hours}h {mins}m'
+        else:
+            return f'{mins}m'
+    except Exception:
+        return ''
+
+def fetch_account_usage(acc_key, acc_info):
+    acc_path = acc_info.get('path')
+    if not acc_path or not os.path.exists(acc_path):
+        return acc_key, {'error': 'Missing token file'}
+    try:
+        with open(acc_path) as f:
+            data = json.load(f)
+    except Exception as e:
+        return acc_key, {'error': str(e)}
+
+    # Proactively refresh token only if expiring soon (< 5 mins)
+    if is_token_expiring_soon(data, threshold_minutes=5):
+        if refresh_token_payload(data):
+            try:
+                with open(acc_path, 'w') as f:
+                    json.dump(data, f, indent=2)
+            except Exception:
+                pass
+
+    agy_bin = REAL_AGY if os.path.exists(REAL_AGY) else shutil.which('agy')
+    if not agy_bin:
+        return acc_key, {'error': 'agy binary not found'}
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cli_dir = os.path.join(tmpdir, '.gemini', 'antigravity-cli')
+        os.makedirs(cli_dir, exist_ok=True)
+        t_path = os.path.join(cli_dir, 'antigravity-oauth-token')
+        with open(t_path, 'w') as f:
+            json.dump(data, f)
+        os.chmod(t_path, 0o600)
+
+        env = os.environ.copy()
+        env['HOME'] = tmpdir
+        try:
+            res = subprocess.run(
+                [agy_bin, '-p', '/usage', '--output-format', 'json'],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=10
+            )
+            out = json.loads(res.stdout)
+            groups = out.get('command', {}).get('data', {}).get('groups', [])
+            stats = {
+                'gemini_5h': (100, None),
+                'gemini_weekly': (100, None),
+                'claude_5h': (100, None),
+                'claude_weekly': (100, None),
+            }
+            for g in groups:
+                gname = g.get('name', '').lower()
+                for b in g.get('buckets', []):
+                    bid = b.get('id', '')
+                    window = b.get('window', '')
+                    rem = int(b.get('remaining_fraction', 0) * 100)
+                    reset_time = b.get('reset_time')
+                    if 'gemini' in gname:
+                        if window == '5h' or '5h' in bid:
+                            stats['gemini_5h'] = (rem, reset_time)
+                        elif window == 'weekly' or 'weekly' in bid:
+                            stats['gemini_weekly'] = (rem, reset_time)
+                    elif 'claude' in gname or '3p' in gname or 'gpt' in gname:
+                        if window == '5h' or '5h' in bid:
+                            stats['claude_5h'] = (rem, reset_time)
+                        elif window == 'weekly' or 'weekly' in bid:
+                            stats['claude_weekly'] = (rem, reset_time)
+            return acc_key, stats
+        except Exception as e:
+            return acc_key, {'error': str(e)}
+
+def fetch_all_usages(accounts, m, on_account_done=None):
+    usages = {}
+    if not accounts:
+        return usages
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(accounts), 8)) as ex:
+        futs = {ex.submit(fetch_account_usage, k, m[k]): k for k in accounts}
+        for fut in concurrent.futures.as_completed(futs):
+            k, res = fut.result()
+            usages[k] = res
+            if on_account_done:
+                on_account_done(k, res)
+    save_quota_cache(usages)
+    return usages
+
+def print_detailed_table(accounts, active_key, usages):
+    headers = ["#", "Account", "Gemini (5h)", "Gemini (Wk)", "Claude (5h)", "Claude (Wk)", "Status"]
+    rows = []
+    for i, k in enumerate(accounts, 1):
+        status = "* active" if k == active_key else ""
+        u = usages.get(k, {})
+        if 'error' in u:
+            rows.append([str(i), k, "Error", "Error", "Error", "Error", status])
+            continue
+
+        def fmt_cell(val_tuple):
+            if not val_tuple:
+                return "N/A"
+            pct, r_time = val_tuple
+            r_str = format_reset_time(r_time)
+            if pct < 100 and r_str:
+                return f"{pct}% ({r_str})"
+            return f"{pct}%"
+
+        g_5h = fmt_cell(u.get('gemini_5h'))
+        g_wk = fmt_cell(u.get('gemini_weekly'))
+        c_5h = fmt_cell(u.get('claude_5h'))
+        c_wk = fmt_cell(u.get('claude_weekly'))
+        rows.append([str(i), k, g_5h, g_wk, c_5h, c_wk, status])
+
+    col_widths = [len(h) for h in headers]
+    for row in rows:
+        for idx, cell in enumerate(row):
+            col_widths[idx] = max(col_widths[idx], len(cell))
+
+    def border(left, mid, right, sep='─'):
+        return left + mid.join(sep * (w + 2) for w in col_widths) + right
+
+    top = border('┌', '┬', '┐')
+    sep = border('├', '┼', '┤')
+    bot = border('└', '┴', '┘')
+
+    def fmt_row(vals):
+        cells = [f" {vals[idx]:<{col_widths[idx]}} " for idx in range(len(vals))]
+        return "│" + "│".join(cells) + "│"
+
+    print("\n" + top)
+    print(fmt_row(headers))
+    print(sep)
+    for r in rows:
+        print(fmt_row(r))
+    print(bot + "\n")
+
+def format_account_line(idx, acc_key, is_active, usage_info):
+    marker = " * (active)" if is_active else ""
+    if usage_info is None:
+        quota_str = " [Gemini: 5h: ⏳ ... | Wk: ⏳ ...]"
+    elif 'error' in usage_info:
+        quota_str = " [Gemini: Error]"
+    else:
+        g_5h = usage_info.get('gemini_5h')
+        g_wk = usage_info.get('gemini_weekly')
+        g_5h_str = f"{g_5h[0]}%" if g_5h else "N/A"
+        g_wk_str = f"{g_wk[0]}%" if g_wk else "N/A"
+        quota_str = f" [Gemini: 5h: {g_5h_str} | Wk: {g_wk_str}]"
+    return f"  [{idx}] {acc_key}{marker}{quota_str}"
+
+def list_accounts(detailed_table=False, force_refresh=False):
+    m = load_manifest()
+    active_key = m.get('__active__')
+    accounts = [k for k in m.keys() if not k.startswith('__')]
+    if not accounts:
+        print("No accounts saved yet. Run 'agy-switch --save' to save current account.")
+        return []
+
+    cached = None if force_refresh else load_quota_cache(accounts)
+
+    if detailed_table:
+        if cached is not None:
+            print_detailed_table(accounts, active_key, cached)
+            return accounts
+
+        completed = 0
+        total = len(accounts)
+        print(f"Fetching quota status... (0/{total})", end="", flush=True)
+
+        def on_done_detailed(k, res):
+            nonlocal completed
+            completed += 1
+            print(f"\rFetching quota status... ({completed}/{total})", end="", flush=True)
+
+        usages = fetch_all_usages(accounts, m, on_account_done=on_done_detailed)
+        print("\r" + " " * 40 + "\r", end="", flush=True)
+        print_detailed_table(accounts, active_key, usages)
+        return accounts
+
+    # Compact listing for interactive menu
+    if cached is not None:
+        print("Saved accounts:")
+        for i, k in enumerate(accounts, 1):
+            print(format_account_line(i, k, k == active_key, cached.get(k)))
+        print("")
+        return accounts
+
+    # Progressive / Skeleton loading
+    print("Saved accounts:")
+    if sys.stdout.isatty():
+        for i, k in enumerate(accounts, 1):
+            print(format_account_line(i, k, k == active_key, None))
+
+        stdout_lock = threading.Lock()
+        total_accounts = len(accounts)
+        acc_index_map = {k: i for i, k in enumerate(accounts)}
+
+        def on_done_skeleton(acc_key, res):
+            idx = acc_index_map.get(acc_key, 0)
+            lines_up = total_accounts - idx
+            updated_line = format_account_line(idx + 1, acc_key, acc_key == active_key, res)
+            with stdout_lock:
+                sys.stdout.write(f"\033[{lines_up}A\r\033[K{updated_line}\033[{lines_up}B\r")
+                sys.stdout.flush()
+
+        usages = fetch_all_usages(accounts, m, on_account_done=on_done_skeleton)
+        print("")
+    else:
+        print("Fetching quota status...", end="", flush=True)
+        usages = fetch_all_usages(accounts, m)
+        print("\r" + " " * 30 + "\r", end="", flush=True)
+        for i, k in enumerate(accounts, 1):
+            print(format_account_line(i, k, k == active_key, usages.get(k)))
+        print("")
+
+    return accounts
+
+def interactive_menu(force_refresh=False):
+    accounts = list_accounts(detailed_table=False, force_refresh=force_refresh)
+    print("Commands:")
+    print("  [1-N] Select account number to switch")
+    print("  [s]   Save current account as a new entry")
+    print("  [e]   Export accounts to a backup file")
+    print("  [i]   Import accounts from a backup file")
+    print("  [r]   Refresh quota data")
+    print("  [l]   Logout from current account")
+    print("  [q]   Quit")
+    try:
+        choice = input("\nEnter choice: ").strip()
+    except (KeyboardInterrupt, EOFError):
+        print("")
+        return
+
+    if not choice or choice.lower() == 'q':
+        return
+    elif choice.lower() == 's':
+        save_account()
+    elif choice.lower() == 'e':
+        acc_input = input("Enter account numbers or names to export (space-separated, or Enter for all): ").strip()
+        targets = acc_input.split() if acc_input else None
+        f_input = input("Enter output file path (default: agy-backup.json): ").strip()
+        export_accounts(dest_file=f_input if f_input else None, target_accounts=targets)
+    elif choice.lower() == 'i':
+        f_input = input("Enter path to backup file: ").strip()
+        if f_input:
+            import_accounts(f_input)
+        else:
+            print("Import cancelled: no file specified.")
+    elif choice.lower() == 'r':
+        interactive_menu(force_refresh=True)
+    elif choice.lower() == 'l':
+        logout()
+    elif choice.isdigit():
+        switch_account(choice)
+    else:
+        switch_account(choice)
+
+def logout():
+    """Wipes active session tokens so user can log into a new account."""
+    for p in TOKEN_PATHS:
+        if os.path.exists(p):
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+    # pkill removed to avoid killing current agent session
+    print("✓ Logged out. Run 'agy' to login with your new account.")
+
+def main():
+    if len(sys.argv) == 1:
+        interactive_menu()
+        return
+
+    # Check if first argument is a number or direct account name (e.g. `agy-switch 1` or `agy-switch work`)
+    first_arg = sys.argv[1]
+    if not first_arg.startswith('-'):
+        switch_account(first_arg)
+        return
+
+    parser = argparse.ArgumentParser(description="Antigravity Account Switcher for WSL & Linux")
+    parser.add_argument('account', nargs='?', help="Account number or name to switch to")
+    parser.add_argument('-s', '--save', nargs='?', const='', help="Save current account (optional: specify name)")
+    parser.add_argument('-w', '--switch', type=str, metavar="ACCOUNT", help="Switch to account by name or index")
+    parser.add_argument('-d', '--delete', type=str, metavar="ACCOUNT", help="Delete a saved account by number or name")
+    parser.add_argument('-l', '--list', action='store_true', help="List saved accounts")
+    parser.add_argument('-r', '--refresh', action='store_true', help="Force refresh quota cache")
+    parser.add_argument('-e', '--export', nargs='*', metavar='ARG', help="Export accounts: --export [FILE] [ACCOUNTS...]")
+    parser.add_argument('-i', '--import', dest='import_file', type=str, metavar="FILE", help="Import accounts from a backup file")
+    parser.add_argument('--logout', action='store_true', help="Clear current session to login to a new account")
+    parser.add_argument('--install-guard', action='store_true', help="Reinstall transparent auto-login wrapper")
+
+    args = parser.parse_args()
+
+    if args.save is not None:
+        save_account(args.save if args.save else None)
+    elif args.delete:
+        delete_account(args.delete)
+    elif args.switch:
+        switch_account(args.switch)
+    elif args.account:
+        switch_account(args.account)
+    elif args.list:
+        list_accounts(detailed_table=True, force_refresh=args.refresh)
+    elif args.export is not None:
+        file_arg = None
+        acc_args = []
+        if args.export:
+            first = args.export[0]
+            if first.endswith('.json') or first.endswith('.bundle') or '/' in first:
+                file_arg = first
+                acc_args = args.export[1:]
+            else:
+                file_arg = "agy-backup.json"
+                acc_args = args.export
+        export_accounts(dest_file=file_arg, target_accounts=acc_args if acc_args else None)
+    elif args.import_file:
+        import_accounts(args.import_file)
+    elif args.logout:
+        logout()
+    elif args.install_guard:
+        install_guardian_wrapper()
+        print("Auto-login guard installed successfully.")
+    elif args.refresh:
+        interactive_menu(force_refresh=True)
+    else:
+        interactive_menu()
+
+if __name__ == '__main__':
+    main()
