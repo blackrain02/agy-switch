@@ -69,6 +69,16 @@ case ":${PATH}:" in
         ;;
 esac
 
+# Check if guardian wrapper directory is in PATH
+GUARD_DIR="${HOME}/.gemini/antigravity-cli/bin"
+case ":${PATH}:" in
+    *":${GUARD_DIR}:"*) ;;
+    *)
+        echo -e "${YELLOW}Notice: For transparent token protection & auto-refresh, ensure guard directory is in PATH:${NC}"
+        echo "  export PATH=\"${GUARD_DIR}:\$PATH\""
+        ;;
+esac
+
 echo ""
 echo -e "${BOLD}Get started:${NC}"
 echo "  agy-switch          # Launch interactive switch menu with live quotas"

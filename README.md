@@ -34,6 +34,7 @@ Saved accounts:
 Commands:
   [1-N] Select account number to switch
   [s]   Save current account as a new entry
+  [d]   Delete a saved account
   [e]   Export accounts to a backup file
   [i]   Import accounts from a backup file
   [r]   Refresh quota data
@@ -128,11 +129,20 @@ agy-switch -r        # Interactive menu with forced refresh
 agy-switch -l -r     # Comparative table with forced refresh
 ```
 
-### 4. Exporting & Importing Accounts (Multi-Machine Sync)
-Transfer accounts to another laptop or remote server without logging in via browser again:
+### 4. Deleting an Account
+Remove accounts interactively or via CLI:
+```bash
+agy-switch -d                 # Prompts for account number or label with confirmation
+agy-switch -d 2               # Deletes account #2 directly
+agy-switch -d user@gmail.com  # Deletes by email or matching label
+```
+If the active account is deleted, `agy-switch` automatically switches the active session to the next available account.
+
+### 5. Exporting & Importing Accounts (Multi-Machine Sync)
+Transfer accounts to another workstation or remote VPS without logging in via browser again:
 
 ```bash
-# Export all accounts
+# Export all accounts (preserves currently active account)
 agy-switch -e backup.json
 
 # Export selected accounts only
@@ -143,17 +153,19 @@ agy-switch -e backup.json user.work@gmail.com
 agy-switch -i backup.json
 ```
 The importer automatically:
-1. Rewrites file paths to match the target machine's `$HOME`.
+1. Adapts file paths to match target machine's `$HOME`.
 2. Merges accounts into the local manifest.
-3. Automatically refreshes expired OAuth access tokens.
-4. Installs the self-healing guardian wrapper.
+3. Automatically refreshes expired OAuth access tokens via Google API.
+4. Synchronizes tokens to both file storage (`antigravity-oauth-token`, `jetski-standalone-oauth-token`) and OS Keyrings (Linux D-Bus Secret Service & macOS Keychain).
+5. Automatically activates the imported profile so `agy` is immediately authenticated and ready to run.
+6. Installs the self-healing guardian wrapper.
 
 ---
 
 ## ⚙️ Command-Line Interface
 
 ```text
-usage: agy-switch [-h] [-s [SAVE]] [-w ACCOUNT] [-d ACCOUNT] [-l] [-r]
+usage: agy-switch [-h] [-s [SAVE]] [-w ACCOUNT] [-d [ACCOUNT]] [-l] [-r]
                   [-e [ARG ...]] [-i FILE] [--logout] [--install-guard]
                   [account]
 
@@ -164,7 +176,7 @@ options:
   -h, --help            Show this help message and exit
   -s, --save [NAME]     Save active account (optional custom name)
   -w, --switch ACCOUNT  Switch to account by name or index
-  -d, --delete ACCOUNT  Delete a saved account by number or name
+  -d, --delete [ACCOUNT] Delete a saved account by number or name
   -l, --list            Display detailed quota table
   -r, --refresh         Force refresh quota cache
   -e, --export [ARG ...] Export accounts: --export [FILE] [ACCOUNTS...]

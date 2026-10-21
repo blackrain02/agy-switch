@@ -76,6 +76,181 @@ def save_manifest(m):
     with open(MANIFEST_PATH, 'w') as f:
         json.dump(m, f, indent=2)
 
+def get_linux_keyring_cli():
+    """Reads OAuth token via secret-tool CLI on Linux."""
+    if shutil.which('secret-tool'):
+        try:
+            cmd = ['secret-tool', 'lookup', 'service', 'gemini', 'username', 'antigravity']
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=2.0)
+            if res.returncode == 0 and res.stdout.strip():
+                return json.loads(res.stdout.strip())
+        except Exception:
+            pass
+    return None
+
+def set_linux_keyring_cli(payload_dict):
+    """Writes OAuth token via secret-tool CLI on Linux."""
+    if shutil.which('secret-tool'):
+        try:
+            raw_json = json.dumps(payload_dict)
+            proc = subprocess.Popen(
+                ['secret-tool', 'store', '--label=Password for \'antigravity\' on \'gemini\'', 'service', 'gemini', 'username', 'antigravity'],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+            )
+            proc.communicate(input=raw_json, timeout=3.0)
+            return proc.returncode == 0
+        except Exception:
+            pass
+    return False
+
+def delete_linux_keyring_cli():
+    """Clears OAuth token via secret-tool CLI on Linux."""
+    if shutil.which('secret-tool'):
+        try:
+            subprocess.run(['secret-tool', 'clear', 'service', 'gemini', 'username', 'antigravity'],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=2.0)
+            return True
+        except Exception:
+            pass
+    return False
+
+def get_macos_keychain_token():
+    """Reads OAuth token from macOS Keychain."""
+    if sys.platform != 'darwin' or not shutil.which('security'):
+        return None
+    try:
+        cmd = ['security', 'find-generic-password', '-s', 'gemini', '-a', 'antigravity', '-w']
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=2.0)
+        if res.returncode == 0 and res.stdout.strip():
+            return json.loads(res.stdout.strip())
+    except Exception:
+        pass
+    return None
+
+def set_macos_keychain_token(payload_dict):
+    """Writes OAuth token to macOS Keychain."""
+    if sys.platform != 'darwin' or not shutil.which('security'):
+        return False
+    try:
+        raw_json = json.dumps(payload_dict)
+        cmd = ['security', 'add-generic-password', '-s', 'gemini', '-a', 'antigravity', '-w', raw_json, '-U']
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=3.0)
+        return res.returncode == 0
+    except Exception:
+        pass
+    return False
+
+def delete_macos_keychain_token():
+    """Removes OAuth token from macOS Keychain."""
+    if sys.platform != 'darwin' or not shutil.which('security'):
+        return False
+    try:
+        cmd = ['security', 'delete-generic-password', '-s', 'gemini', '-a', 'antigravity']
+        subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=2.0)
+        return True
+    except Exception:
+        pass
+    return False
+
+def get_keyring_token():
+    """Reads OAuth token from OS Keyring (macOS Keychain / Linux Secret Service)."""
+    if sys.platform == 'darwin':
+        return get_macos_keychain_token()
+    try:
+        import dbus
+        bus = dbus.SessionBus()
+        service = bus.get_object('org.freedesktop.secrets', '/org/freedesktop/secrets')
+        s_iface = dbus.Interface(service, 'org.freedesktop.Secret.Service')
+        unlocked, locked = s_iface.SearchItems({'service': 'gemini', 'username': 'antigravity'})
+        items = list(unlocked)
+        if not items and locked:
+            s_iface.Unlock(locked)
+            unlocked, _ = s_iface.SearchItems({'service': 'gemini', 'username': 'antigravity'})
+            items = list(unlocked)
+        if items:
+            session = s_iface.OpenSession('plain', dbus.String('', variant_level=1))[1]
+            item = bus.get_object('org.freedesktop.secrets', items[0])
+            item_iface = dbus.Interface(item, 'org.freedesktop.Secret.Item')
+            secret = item_iface.GetSecret(session)
+            val = bytes(secret[2]).decode('utf-8')
+            return json.loads(val)
+    except Exception:
+        pass
+    return get_linux_keyring_cli()
+
+def set_keyring_token(payload_dict):
+    """Writes OAuth token to OS Keyring (macOS Keychain / Linux Secret Service)."""
+    if sys.platform == 'darwin':
+        return set_macos_keychain_token(payload_dict)
+    dbus_ok = False
+    try:
+        import dbus
+        bus = dbus.SessionBus()
+        service = bus.get_object('org.freedesktop.secrets', '/org/freedesktop/secrets')
+        s_iface = dbus.Interface(service, 'org.freedesktop.Secret.Service')
+        session = s_iface.OpenSession('plain', dbus.String('', variant_level=1))[1]
+        raw_bytes = dbus.ByteArray(json.dumps(payload_dict).encode('utf-8'))
+        secret_struct = dbus.Struct((session, dbus.ByteArray(b''), raw_bytes, 'text/plain; charset=utf8'))
+        unlocked, locked = s_iface.SearchItems({'service': 'gemini', 'username': 'antigravity'})
+        items = list(unlocked) + list(locked)
+        if items:
+            item = bus.get_object('org.freedesktop.secrets', items[0])
+            item_iface = dbus.Interface(item, 'org.freedesktop.Secret.Item')
+            item_iface.SetSecret(secret_struct)
+            dbus_ok = True
+        else:
+            default_col = bus.get_object('org.freedesktop.secrets', '/org/freedesktop/secrets/aliases/default')
+            col_iface = dbus.Interface(default_col, 'org.freedesktop.Secret.Collection')
+            props = {
+                'org.freedesktop.Secret.Item.Label': dbus.String("Password for 'antigravity' on 'gemini'", variant_level=1),
+                'org.freedesktop.Secret.Item.Attributes': dbus.Dictionary({
+                    'service': 'gemini',
+                    'username': 'antigravity',
+                    'xdg:schema': 'org.freedesktop.Secret.Generic'
+                }, signature='ss', variant_level=1)
+            }
+            col_iface.CreateItem(props, secret_struct, True)
+            dbus_ok = True
+    except Exception:
+        dbus_ok = False
+    if not dbus_ok:
+        set_linux_keyring_cli(payload_dict)
+    return dbus_ok
+
+def delete_keyring_token():
+    """Removes OAuth token from OS Keyring (macOS Keychain / Linux Secret Service)."""
+    if sys.platform == 'darwin':
+        return delete_macos_keychain_token()
+    try:
+        import dbus
+        bus = dbus.SessionBus()
+        service = bus.get_object('org.freedesktop.secrets', '/org/freedesktop/secrets')
+        s_iface = dbus.Interface(service, 'org.freedesktop.Secret.Service')
+        unlocked, locked = s_iface.SearchItems({'service': 'gemini', 'username': 'antigravity'})
+        for item_path in list(unlocked) + list(locked):
+            item = bus.get_object('org.freedesktop.secrets', item_path)
+            item_iface = dbus.Interface(item, 'org.freedesktop.Secret.Item')
+            item_iface.Delete()
+    except Exception:
+        pass
+    delete_linux_keyring_cli()
+    return True
+
+def get_active_token_payload():
+    """Returns the active token payload from files or OS keyring."""
+    for p in TOKEN_PATHS:
+        if os.path.exists(p) and os.path.getsize(p) > 0:
+            try:
+                data = json.load(open(p))
+                if data and data.get('token'):
+                    return data
+            except Exception:
+                pass
+    keyring_data = get_keyring_token()
+    if keyring_data and keyring_data.get('token'):
+        return keyring_data
+    return None
+
 def get_active_token_path():
     """Returns the primary token path that exists, or the first default path."""
     for p in TOKEN_PATHS:
@@ -84,7 +259,7 @@ def get_active_token_path():
     return TOKEN_PATHS[0]
 
 def sync_token_to_all_paths(payload_dict):
-    """Writes token payload to all known Antigravity token locations."""
+    """Writes token payload to all known Antigravity token locations and OS keyring."""
     for p in TOKEN_PATHS:
         try:
             os.makedirs(os.path.dirname(p), exist_ok=True)
@@ -93,6 +268,7 @@ def sync_token_to_all_paths(payload_dict):
             os.chmod(p, 0o600)
         except Exception:
             pass
+    set_keyring_token(payload_dict)
 
 def refresh_token_payload(payload):
     """Silently refreshes access_token AND id_token via Google OAuth."""
@@ -179,26 +355,42 @@ def invalidate_quota_cache():
         except Exception:
             pass
 
-def get_email_from_token():
-    for p in TOKEN_PATHS:
-        if not os.path.exists(p):
-            continue
+def get_email_from_token(payload=None):
+    if not payload:
+        payload = get_active_token_payload()
+    if not payload:
+        return None
+
+    # 1. Fast offline decoding from id_token
+    id_token = payload.get('id_token')
+    if id_token and isinstance(id_token, str):
         try:
-            data = json.load(open(p))
-            token = data.get('token', {})
-            acc = token.get('access_token')
-            if not acc:
-                continue
-            req = urllib.request.Request(
-                'https://www.googleapis.com/oauth2/v3/userinfo',
-                headers={'Authorization': f'Bearer {acc}'}
-            )
-            with urllib.request.urlopen(req, timeout=3.0) as resp:
-                email = json.loads(resp.read().decode()).get('email')
+            import base64
+            parts = id_token.split('.')
+            if len(parts) >= 2:
+                rem = len(parts[1]) % 4
+                padded = parts[1] + '=' * ((4 - rem) % 4)
+                jwt_data = json.loads(base64.urlsafe_b64decode(padded))
+                email = jwt_data.get('email')
                 if email:
                     return email
         except Exception:
             pass
+
+    # 2. Fallback to userinfo API
+    try:
+        acc = payload.get('token', {}).get('access_token')
+        if acc:
+            req = urllib.request.Request(
+                'https://www.googleapis.com/oauth2/v3/userinfo',
+                headers={'Authorization': f'Bearer {acc}'}
+            )
+            with urllib.request.urlopen(req, timeout=4.0) as resp:
+                email = json.loads(resp.read().decode()).get('email')
+                if email:
+                    return email
+    except Exception:
+        pass
     return None
 
 def install_guardian_wrapper():
@@ -333,17 +525,7 @@ else:
     os.chmod(WRAPPER_PATH, 0o755)
 
 def save_account(label=None):
-    active_path = None
-    data = None
-    for p in TOKEN_PATHS:
-        if os.path.exists(p) and os.path.getsize(p) > 0:
-            try:
-                data = json.load(open(p))
-                active_path = p
-                break
-            except Exception:
-                pass
-
+    data = get_active_token_payload()
     if not data or not data.get('token'):
         sys.exit("Error: No active token found.\nPlease login once using 'agy' before saving.")
 
@@ -352,7 +534,7 @@ def save_account(label=None):
     if 'auth_method' not in data:
         data['auth_method'] = 'consumer'
 
-    email = label or get_email_from_token() or input("Enter account label (e.g. email or nickname): ").strip()
+    email = label or get_email_from_token(data) or input("Enter account label (e.g. email or nickname): ").strip()
     if not email:
         sys.exit("Error: Account label cannot be empty.")
 
@@ -419,7 +601,7 @@ def switch_account(identifier):
     print(f"✓ Switched to: {target_key}")
 
 
-def delete_account(identifier):
+def delete_account(identifier, confirm=False):
     m = load_manifest()
     accounts = [k for k in m.keys() if not k.startswith('__')]
 
@@ -439,6 +621,16 @@ def delete_account(identifier):
     if not target_key:
         sys.exit(f"Error: Account '{identifier}' not found.")
 
+    if confirm:
+        try:
+            ans = input(f"Are you sure you want to delete '{target_key}'? [y/N]: ").strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            print("\nDeletion cancelled.")
+            return
+        if ans != 'y':
+            print("Deletion cancelled.")
+            return
+
     acc_info = m.pop(target_key, {})
     acc_path = acc_info.get('path')
     if acc_path and os.path.exists(acc_path):
@@ -451,8 +643,19 @@ def delete_account(identifier):
         remaining = [k for k in m.keys() if not k.startswith('__')]
         if remaining:
             m['__active__'] = remaining[0]
+            save_manifest(m)
+            invalidate_quota_cache()
+            print(f"✓ Deleted account: {target_key}")
+            print(f"Switching active session to: {remaining[0]}")
+            switch_account(remaining[0])
+            return
         else:
             m.pop('__active__', None)
+            save_manifest(m)
+            invalidate_quota_cache()
+            print(f"✓ Deleted account: {target_key}")
+            logout()
+            return
 
     save_manifest(m)
     invalidate_quota_cache()
@@ -490,9 +693,11 @@ def export_accounts(dest_file=None, target_accounts=None):
     else:
         selected = all_accounts
 
+    active_acc = m.get('__active__')
     bundle = {
         "version": 1,
         "exported_at": datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        "active_account": active_acc if (active_acc in selected) else (selected[0] if selected else None),
         "accounts": {}
     }
 
@@ -574,23 +779,24 @@ def import_accounts(src_file):
         except Exception as e:
             print(f"  ✗ Failed to save '{acc_name}': {e}")
 
-    # If no active account is currently set on target machine, activate the first one
-    if not m.get('__active__') and accounts_data:
-        first_acc = list(accounts_data.keys())[0]
-        m['__active__'] = first_acc
-        acc_path = m[first_acc]['path']
-        try:
-            with open(acc_path) as f:
-                d = json.load(f)
-            sync_token_to_all_paths(d)
-            print(f"  ✓ Activated: {first_acc}")
-        except Exception:
-            pass
-
     save_manifest(m)
     invalidate_quota_cache()
     install_guardian_wrapper()
-    print(f"\n✓ Successfully imported {imported_count} account(s) and configured environment.\n")
+
+    # Determine and immediately activate profile on the target machine
+    active_to_restore = bundle.get("active_account")
+    if not active_to_restore or active_to_restore not in m:
+        if imported_count > 0:
+            active_to_restore = list(accounts_data.keys())[0]
+
+    if active_to_restore and active_to_restore in m:
+        print(f"\nActivating imported profile: {active_to_restore}...")
+        switch_account(active_to_restore)
+
+    print(f"\n✓ Successfully imported {imported_count} account(s) and configured environment.")
+    if active_to_restore and active_to_restore in m:
+        print(f"✓ Active profile set to: {active_to_restore}")
+        print("  You can now run 'agy' immediately without re-authenticating.\n")
 
 def format_reset_time(iso_str):
     if not iso_str:
@@ -769,6 +975,11 @@ def list_accounts(detailed_table=False, force_refresh=False):
         print("No accounts saved yet. Run 'agy-switch --save' to save current account.")
         return []
 
+    if not active_key or active_key not in accounts:
+        cur_email = get_email_from_token()
+        if cur_email and cur_email in accounts:
+            active_key = cur_email
+
     cached = None if force_refresh else load_quota_cache(accounts)
 
     if detailed_table:
@@ -833,6 +1044,7 @@ def interactive_menu(force_refresh=False):
     print("Commands:")
     print("  [1-N] Select account number to switch")
     print("  [s]   Save current account as a new entry")
+    print("  [d]   Delete a saved account")
     print("  [e]   Export accounts to a backup file")
     print("  [i]   Import accounts from a backup file")
     print("  [r]   Refresh quota data")
@@ -848,6 +1060,23 @@ def interactive_menu(force_refresh=False):
         return
     elif choice.lower() == 's':
         save_account()
+    elif choice.lower() == 'd' or choice.lower().startswith('d '):
+        if not accounts:
+            print("No saved accounts to delete.")
+            return
+        parts = choice.split(maxsplit=1)
+        if len(parts) > 1:
+            acc_input = parts[1].strip()
+        else:
+            try:
+                acc_input = input("Enter account number or name to delete: ").strip()
+            except (KeyboardInterrupt, EOFError):
+                print("\nDelete cancelled.")
+                return
+        if acc_input:
+            delete_account(acc_input, confirm=True)
+        else:
+            print("Delete cancelled: no account specified.")
     elif choice.lower() == 'e':
         acc_input = input("Enter account numbers or names to export (space-separated, or Enter for all): ").strip()
         targets = acc_input.split() if acc_input else None
@@ -876,6 +1105,7 @@ def logout():
                 os.remove(p)
             except Exception:
                 pass
+    delete_keyring_token()
     # pkill removed to avoid killing current agent session
     print("✓ Logged out. Run 'agy' to login with your new account.")
 
@@ -894,7 +1124,7 @@ def main():
     parser.add_argument('account', nargs='?', help="Account number or name to switch to")
     parser.add_argument('-s', '--save', nargs='?', const='', help="Save current account (optional: specify name)")
     parser.add_argument('-w', '--switch', type=str, metavar="ACCOUNT", help="Switch to account by name or index")
-    parser.add_argument('-d', '--delete', type=str, metavar="ACCOUNT", help="Delete a saved account by number or name")
+    parser.add_argument('-d', '--delete', nargs='?', const='', metavar="ACCOUNT", help="Delete a saved account by number or name")
     parser.add_argument('-l', '--list', action='store_true', help="List saved accounts")
     parser.add_argument('-r', '--refresh', action='store_true', help="Force refresh quota cache")
     parser.add_argument('-e', '--export', nargs='*', metavar='ARG', help="Export accounts: --export [FILE] [ACCOUNTS...]")
@@ -906,8 +1136,16 @@ def main():
 
     if args.save is not None:
         save_account(args.save if args.save else None)
-    elif args.delete:
-        delete_account(args.delete)
+    elif args.delete is not None:
+        try:
+            target = args.delete if args.delete else input("Enter account number or name to delete: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\nDelete cancelled.")
+            return
+        if target:
+            delete_account(target, confirm=True if not args.delete else False)
+        else:
+            print("Delete cancelled: no account specified.")
     elif args.switch:
         switch_account(args.switch)
     elif args.account:
